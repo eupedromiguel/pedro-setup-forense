@@ -66,6 +66,10 @@ Estrutura criada por `pf-novo-caso`:
 └── 05_relatorio/
 ```
 
+<p>
+  <img src="docs/banner3.png" alt="Banner 2" width="100%" />
+</p>
+
 ## Como usar
 
 **Requisitos sugeridos da VM (VirtualBox):** Ubuntu 22.04/24.04 ou Kali, 2 vCPUs, 4 GB de RAM, 60 GB de disco, rede em NAT durante a instalação.
