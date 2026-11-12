@@ -4,7 +4,13 @@ Script que transforma uma VM Linux recém-instalada em uma **estação de Forens
 
 > Projeto de portfólio - laboratório de estudos em Segurança da Informação / DFIR.
 
-docs/banner.png
+<p>
+  <img src="docs/banner.png" alt="Banner" width="100%" />
+</p>
+
+<p>
+  <img src="docs/banner2.png" alt="Banner 2" width="100%" />
+</p>
 
 ---
 
