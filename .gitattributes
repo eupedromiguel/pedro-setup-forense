@@ -1,0 +1,4 @@
+# Mantém finais de linha LF nos scripts (CRLF quebra o bash na VM)
+*.sh text eol=lf
+*.md text eol=lf
+*.png binary

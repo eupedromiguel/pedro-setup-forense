@@ -6,38 +6,48 @@
 #  Forense Digital para laboratório:
 #    - instala ferramentas de aquisição, análise de disco, carving, hashes,
 #      malware, rede e artefatos Windows;
-#    - desativa a montagem automática de mídias (proteção de evidências);
+#    - desativa o swap (dados de evidência não vão parar no disco da estação);
+#    - protege evidências: sem montagem automática, discos USB em somente
+#      leitura no kernel e montagens do udisks em somente leitura;
 #    - cria utilitários de caso (pf-novo-caso, pf-nota, pf-hash,
-#      pf-bloquear, pf-adquirir) e a pasta ~/forense;
+#      pf-bloquear, pf-montar, pf-adquirir) e a pasta ~/forense;
+#    - valida a integridade do sistema (dpkg --verify, rkhunter, chkrootkit);
 #    - gera um inventário das ferramentas com versão e SHA-256 dos binários.
 #
 #  Autor  : Pedro Ataides
-#  Versão : 1.0.0
+#  Versão : 1.1.0
 #  Licença: MIT
 #
 #  Uso    : sudo ./pedro-setup-forense.sh [opções]
-#             -n, --dry-run      mostra o que seria feito, sem alterar nada
-#             -g, --sem-gui      não instala ferramentas gráficas
-#             -p, --sem-python   não instala ferramentas Python (pipx)
-#             -y, --sim          não pede confirmação
-#             -h, --help         mostra esta ajuda
+#             -n, --dry-run          mostra o que seria feito, sem alterar nada
+#             -g, --sem-gui          não instala ferramentas gráficas
+#             -p, --sem-python       não instala ferramentas Python (pipx)
+#             -s, --manter-swap      não desativa o swap
+#             -i, --sem-verificacao  não valida a integridade do sistema
+#             -y, --sim              não pede confirmação
+#             -h, --help             mostra esta ajuda
 # =============================================================================
 set -Eeuo pipefail
 
-readonly VERSAO="1.0.0"
+readonly VERSAO="1.1.0"
 CARIMBO="$(date -u +%Y%m%dT%H%M%SZ)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly CARIMBO SCRIPT_PATH
-readonly TOTAL_ETAPAS=7
+readonly TOTAL_ETAPAS=9
 readonly REGRA_UDEV="/etc/udev/rules.d/99-pedro-forense-sem-automount.rules"
+readonly REGRA_UDEV_RO="/etc/udev/rules.d/99-pedro-forense-usb-somente-leitura.rules"
+readonly UDISKS_CONF="/etc/udisks2/mount_options.conf"
+readonly FSTAB="/etc/fstab"
 
 export DEBIAN_FRONTEND=noninteractive
 APT_OPTS=(-y -q -o DPkg::Lock::Timeout=300
           -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
 # --- Catálogo de pacotes: "Categoria|pacote pacote ..." ----------------------
+# "a/b" = alternativas: usa a primeira já instalada ou disponível na distro
+# (ex.: o Kali trocou o p7zip-full pelo pacote 7zip).
 CATALOGO=(
-  "Base e utilitários|curl wget git jq unzip p7zip-full xxd hexedit sqlite3 file tree python3-pip pipx dosfstools mtools"
+  "Base e utilitários|curl wget git jq unzip p7zip-full/7zip xxd hexedit sqlite3 file tree python3-pip pipx dosfstools mtools"
   "Aquisição e imagens|dc3dd dcfldd ewf-tools afflib-tools qemu-utils"
   "Disco e sistemas de arquivos|sleuthkit testdisk libvshadow-utils ntfs-3g"
   "Carving e metadados|foremost scalpel binwalk bulk-extractor libimage-exiftool-perl exiv2"
@@ -67,8 +77,9 @@ FERRAMENTAS=(
 )
 
 # --- Estado -------------------------------------------------------------------
-DRY_RUN=0; COM_GUI=1; COM_PY=1; ASSUMIR_SIM=0
+DRY_RUN=0; COM_GUI=1; COM_PY=1; ASSUMIR_SIM=0; DESATIVAR_SWAP=1; VERIFICAR=1
 ETAPA_ATUAL=0; DISTRO_ID=""; DISTRO_NOME=""; LOG=""; INVENTARIO=""
+RELATORIO_INTEGRIDADE=""; RESUMO_INTEGRIDADE=(); RESUMO_SWAP=""
 INSTALADOS=(); JA_PRESENTES=(); PULADOS=(); FALHAS=(); PY_OK=(); PARA_INSTALAR=()
 
 USUARIO="${SUDO_USER:-$(id -un)}"
@@ -206,11 +217,15 @@ uso() {
   cat <<EOF
 Uso: sudo ./$(basename "$SCRIPT_PATH") [opções]
 
-  -n, --dry-run      mostra o que seria feito, sem alterar nada
-  -g, --sem-gui      não instala ferramentas gráficas (wireshark, guymager...)
-  -p, --sem-python   não instala ferramentas Python via pipx (volatility3...)
-  -y, --sim          não pede confirmação
-  -h, --help         mostra esta ajuda
+  -n, --dry-run          mostra o que seria feito, sem alterar nada
+  -g, --sem-gui          não instala ferramentas gráficas (wireshark, guymager...)
+  -p, --sem-python       não instala ferramentas Python via pipx (volatility3...)
+  -s, --manter-swap      não desativa o swap
+  -i, --sem-verificacao  não valida a integridade do sistema (dpkg/rkhunter/chkrootkit)
+  -y, --sim              não pede confirmação
+  -h, --help             mostra esta ajuda
+
+Rode ANTES de conectar qualquer evidência à VM.
 EOF
 }
 
@@ -220,6 +235,8 @@ ler_opcoes() {
       -n|--dry-run)    DRY_RUN=1 ;;
       -g|--sem-gui)    COM_GUI=0 ;;
       -p|--sem-python) COM_PY=0 ;;
+      -s|--manter-swap)     DESATIVAR_SWAP=0 ;;
+      -i|--sem-verificacao) VERIFICAR=0 ;;
       -y|--sim)        ASSUMIR_SIM=1 ;;
       -h|--help)       uso; exit 0 ;;
       *) erro "Opção desconhecida: $1"; uso; exit 2 ;;
@@ -235,7 +252,7 @@ preparar_log() {
   chmod 0750 "$dir"
   LOG="$dir/setup-$CARIMBO.log"
   : >"$LOG"
-  registrar "pedro-setup-forense v$VERSAO | dry-run=$DRY_RUN gui=$COM_GUI python=$COM_PY | usuario=$USUARIO"
+  registrar "pedro-setup-forense v$VERSAO | dry-run=$DRY_RUN gui=$COM_GUI python=$COM_PY swap-off=$DESATIVAR_SWAP verificacao=$VERIFICAR | usuario=$USUARIO"
 }
 
 # --- 1. Ambiente ----------------------------------------------------------------
@@ -319,20 +336,29 @@ pacote_disponivel() {
 instalar_pacotes() {
   etapa "Instalando ferramentas forenses"
   local -a catalogo=("${CATALOGO[@]}") lista
-  local item categoria pacotes p novos
+  local item categoria pacotes entrada p alt novos
+  local -a alternativas
   if (( COM_GUI )); then catalogo+=("${CATALOGO_GUI[@]}"); else info "Ferramentas gráficas puladas (--sem-gui)"; fi
 
   for item in "${catalogo[@]}"; do
     IFS='|' read -r categoria pacotes <<<"$item"
     read -ra lista <<<"$pacotes"
     novos=0
-    for p in "${lista[@]}"; do
-      if pacote_instalado "$p"; then
-        JA_PRESENTES+=("$p")
-      elif pacote_disponivel "$p"; then
+    for entrada in "${lista[@]}"; do
+      IFS='/' read -ra alternativas <<<"$entrada"
+      p=""
+      # 1º: alguma alternativa já instalada; 2º: a primeira disponível.
+      for alt in "${alternativas[@]}"; do
+        if pacote_instalado "$alt"; then p="$alt"; break; fi
+      done
+      if [[ -n "$p" ]]; then JA_PRESENTES+=("$p"); continue; fi
+      for alt in "${alternativas[@]}"; do
+        if pacote_disponivel "$alt"; then p="$alt"; break; fi
+      done
+      if [[ -n "$p" ]]; then
         PARA_INSTALAR+=("$p"); novos=$((novos + 1))
       else
-        PULADOS+=("$p")
+        PULADOS+=("${entrada//\// ou }")
       fi
     done
     printf '    %s %2d pacote(s), %d a instalar\n' "$(alinhar "$categoria" 30)" "${#lista[@]}" "$novos"
@@ -388,9 +414,76 @@ instalar_python() {
   executar como_usuario pipx ensurepath || true
 }
 
-# --- 5. Proteção de evidências ----------------------------------------------------
+# --- 5. Swap --------------------------------------------------------------------
+# Regex de uma linha ativa de swap no fstab: <origem> <ponto> swap ...
+readonly RE_SWAP_FSTAB='^[[:space:]]*[^#[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)'
+
+desativar_swap() {
+  etapa "Desativando o swap (evita que dados de evidência vão parar no disco)"
+  if (( ! DESATIVAR_SWAP )); then
+    info "Pulado (--manter-swap)"; RESUMO_SWAP="mantido (--manter-swap)"; return 0
+  fi
+
+  local ram_mb ativos unidade
+  ram_mb="$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)"
+  if (( ram_mb < 3800 )); then
+    aviso "A VM tem ${ram_mb} MB de RAM. Sem swap, ferramentas pesadas (Autopsy, Volatility) podem ser encerradas por falta de memória — recomendado 4 GB ou mais."
+  fi
+
+  # 1. Desliga o que está ativo agora (partição, arquivo ou zram).
+  ativos="$(swapon --show=NAME --noheadings 2>/dev/null | tr '\n' ' ' || true)"
+  if [[ -n "${ativos// /}" ]]; then
+    info "Swap ativo: $ativos"
+    executar swapoff -a
+  else
+    ok "Nenhum swap ativo no momento"
+  fi
+
+  # 2. Impede que volte no boot: comenta as linhas de swap do fstab (com backup).
+  if grep -qE "$RE_SWAP_FSTAB" "$FSTAB" 2>/dev/null; then
+    local backup="$FSTAB.pedro-forense-$CARIMBO.bak"
+    executar cp -a "$FSTAB" "$backup"
+    executar sed -i -E "s/($RE_SWAP_FSTAB.*)/# [pedro-setup-forense] \\1/" "$FSTAB"
+    (( DRY_RUN )) || ok "Linhas de swap comentadas em $FSTAB (backup: $backup)"
+  else
+    ok "$FSTAB sem entradas de swap ativas"
+  fi
+
+  # 3. Bloqueia ativações automáticas do systemd (partição GPT de swap, zram etc.).
+  if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
+    executar systemctl mask swap.target
+    for unidade in zramswap.service dphys-swapfile.service; do
+      if systemctl cat "$unidade" >/dev/null 2>&1; then
+        executar systemctl disable --now "$unidade" || true
+        executar systemctl mask "$unidade"
+      fi
+    done
+    (( DRY_RUN )) || ok "swap.target mascarado no systemd (nenhuma swap é ativada no boot)"
+  fi
+
+  # 4. Confere.
+  if (( DRY_RUN )); then RESUMO_SWAP="seria desativado"; return 0; fi
+  ativos="$(swapon --show=NAME --noheadings 2>/dev/null | tr '\n' ' ' || true)"
+  if [[ -z "${ativos// /}" ]]; then
+    ok "Swap desativado (swapon --show vazio)"; RESUMO_SWAP="desativado"
+  else
+    erro "Ainda há swap ativo: $ativos"; FALHAS+=("swap"); RESUMO_SWAP="AINDA ATIVO: $ativos"
+  fi
+}
+
+# --- 6. Proteção de evidências ----------------------------------------------------
+# Disco (ou discos, com LVM/RAID) onde está a raiz do sistema, com o barramento.
+transporte_da_raiz() {
+  local origem
+  origem="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  [[ -b "$origem" ]] || { echo "desconhecido"; return 0; }
+  lsblk -snro TRAN "$origem" 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ' || true
+}
+
 configurar_protecoes() {
-  etapa "Protegendo evidências (sem montagem automática de mídias)"
+  etapa "Protegendo evidências (sem montagem automática e somente leitura)"
+
+  # 6.1 Sem montagem automática.
   if (( DRY_RUN )); then
     info "[dry-run] criaria $REGRA_UDEV"
   else
@@ -403,8 +496,54 @@ SUBSYSTEM=="block", ENV{UDISKS_AUTO}="0"
 EOF
     ok "Regra udev criada: $REGRA_UDEV"
   fi
+
+  # 6.2 Discos USB entram em somente leitura no kernel (blockdev --setro) assim que
+  #     aparecem — antes de qualquer montagem. Não aplica se o próprio sistema roda
+  #     de um disco USB (ex.: Kali live/persistente em pendrive), senão travaria a raiz.
+  local transporte blockdev_bin
+  transporte="$(transporte_da_raiz)"
+  blockdev_bin="$(command -v blockdev || echo /usr/sbin/blockdev)"
+  if [[ "$transporte" == *usb* || "$transporte" == "desconhecido" ]]; then
+    aviso "A raiz do sistema está em disco USB ou não foi identificada ($transporte): regra de USB somente leitura NÃO criada. Use 'sudo pf-bloquear /dev/sdX' em cada evidência."
+  elif (( DRY_RUN )); then
+    info "[dry-run] criaria $REGRA_UDEV_RO"
+  else
+    {
+      echo "# pedro-setup-forense: discos USB conectados ficam em SOMENTE LEITURA no kernel"
+      echo "# (blockdev --setro no disco e em cada partição), antes de qualquer montagem."
+      echo "# Para gravar num pendrive seu (ex.: levar o relatório): sudo blockdev --setrw /dev/sdX /dev/sdX1"
+      echo "# Para desfazer: sudo rm este arquivo && sudo udevadm control --reload-rules"
+      printf 'ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", RUN+="%s --setro $devnode"\n' "$blockdev_bin"
+    } >"$REGRA_UDEV_RO"
+    ok "Regra udev criada: $REGRA_UDEV_RO (USB em somente leitura)"
+  fi
+
+  # 6.3 Montagens feitas pelo udisks (gerenciador de arquivos, udisksctl) saem em
+  #     somente leitura, sem executáveis; ext3/ext4 com noload (sem replay do journal).
+  if (( DRY_RUN )); then
+    info "[dry-run] criaria $UDISKS_CONF"
+  else
+    mkdir -p "${UDISKS_CONF%/*}"
+    if [[ -f "$UDISKS_CONF" ]] && ! grep -q 'pedro-setup-forense' "$UDISKS_CONF"; then
+      cp -a "$UDISKS_CONF" "$UDISKS_CONF.pedro-forense-$CARIMBO.bak"
+      info "Backup do $UDISKS_CONF existente: $UDISKS_CONF.pedro-forense-$CARIMBO.bak"
+    fi
+    cat >"$UDISKS_CONF" <<'EOF'
+# pedro-setup-forense: montagens feitas pelo udisks (gerenciador de arquivos,
+# udisksctl) saem em SOMENTE LEITURA, sem executáveis nem dispositivos.
+# ext3/ext4 com noload: não reproduz o journal (que gravaria na mídia).
+# Montagens pelo comando 'mount' não passam por aqui: use 'sudo pf-montar'.
+# Para desfazer: sudo rm este arquivo (vale na próxima montagem)
+[defaults]
+defaults=ro,nosuid,nodev,noexec
+ext3_defaults=errors=remount-ro,noload
+ext4_defaults=errors=remount-ro,noload
+EOF
+    ok "udisks: montagens em somente leitura por padrão ($UDISKS_CONF)"
+  fi
+
   if command -v udevadm >/dev/null; then
-    executar udevadm control --reload-rules || aviso "Não deu para recarregar o udev agora; a regra vale após reiniciar"
+    executar udevadm control --reload-rules || aviso "Não deu para recarregar o udev agora; as regras valem após reiniciar"
   fi
 
   # Ambientes gráficos (GNOME no Ubuntu, XFCE no Kali): ajusta se houver sessão ativa.
@@ -428,7 +567,7 @@ EOF
   fi
 }
 
-# --- 6. Utilitários pf-* e pasta ~/forense ----------------------------------------
+# --- 7. Utilitários pf-* e pasta ~/forense ----------------------------------------
 criar_dir() {
   if (( DRY_RUN )); then info "[dry-run] criaria $1"; return 0; fi
   install -d -m 0750 -o "$USUARIO" -g "$GRUPO_USUARIO" "$1"
@@ -595,6 +734,77 @@ done
 echo "Obs.: o bloqueio por software complementa, mas não substitui, um write-blocker físico."
 UTIL
 
+  instalar_utilitario pf-montar <<'UTIL'
+#!/usr/bin/env bash
+# pf-montar — monta uma evidência em SOMENTE LEITURA, com opções forenses
+#   - bloqueia escrita no disco inteiro antes (pf-bloquear)
+#   - ro,noexec,nodev,nosuid + sem replay de journal (ext3/4: noload, xfs: norecovery)
+#   - aceita partição (/dev/sdX1) ou arquivo de imagem (.dd/.raw), via loop somente leitura
+set -euo pipefail
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+  echo "Uso: sudo -E pf-montar <partição /dev/sdX1 | imagem.dd> [ponto de montagem]"
+  echo "Padrão do ponto de montagem: /mnt/evidencia/<nome>"
+  exit 1
+fi
+if [[ $EUID -ne 0 ]]; then echo "Precisa de root: sudo -E pf-montar $*" >&2; exit 1; fi
+origem="$1"
+
+if [[ -f "$origem" ]]; then
+  # Imagem: loop somente leitura (-r), com leitura da tabela de partições (-P).
+  dev="$(losetup -r -f -P --show "$origem")"
+  echo "Imagem associada a $dev (somente leitura)"
+  mapfile -t particoes < <(lsblk -lnpo NAME,TYPE "$dev" | awk '$2 == "part" {print $1}')
+  if (( ${#particoes[@]} )); then
+    echo "A imagem tem partições — monte a desejada:" >&2
+    lsblk -po NAME,SIZE,FSTYPE,LABEL "$dev" >&2
+    echo "Ex.: sudo -E pf-montar ${particoes[0]}" >&2
+    exit 3
+  fi
+elif [[ -b "$origem" ]]; then
+  dev="$origem"
+else
+  echo "Origem não é partição nem arquivo: $origem" >&2; exit 1
+fi
+
+# Bloqueia o disco inteiro (e todas as partições), não só a partição montada.
+pai="$(lsblk -dno PKNAME "$dev" 2>/dev/null || true)"
+disco="$dev"; if [[ -n "$pai" ]]; then disco="/dev/$pai"; fi
+pf-bloquear "$disco" >/dev/null
+echo "Escrita bloqueada em $disco (e em todas as partições)"
+
+if findmnt -rno TARGET -S "$dev" >/dev/null 2>&1; then
+  echo "ATENÇÃO: $dev já está montado em $(findmnt -rno TARGET -S "$dev")" >&2; exit 1
+fi
+
+tipo="$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)"
+opcoes="ro,noexec,nodev,nosuid"
+case "$tipo" in
+  ext3|ext4) opcoes+=",noload" ;;
+  xfs)       opcoes+=",norecovery" ;;
+  btrfs)     opcoes+=",rescue=nologreplay" ;;
+  "")        echo "Sistema de arquivos não identificado em $dev" >&2; exit 1 ;;
+esac
+
+ponto="${2:-/mnt/evidencia/$(basename "$dev")}"
+mkdir -p "$ponto"
+mount -o "$opcoes" "$dev" "$ponto"
+
+if findmnt -rno OPTIONS "$ponto" | tr ',' '\n' | grep -qx ro; then
+  echo "Montado em $ponto ($tipo, $opcoes) — somente leitura: SIM"
+else
+  echo "Montado em $ponto, mas NÃO está somente leitura — desmontando." >&2
+  umount "$ponto"; exit 2
+fi
+echo "Para desmontar: sudo umount $ponto"
+if [[ "$disco" == /dev/loop* ]]; then echo "Depois, libere a imagem: sudo losetup -d $disco"; fi
+
+if [[ -n "${PF_CASO:-}" ]]; then
+  printf '%s | %s | Montagem somente leitura de %s em %s (%s, %s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SUDO_USER:-$(id -un)}" "$origem" "$ponto" "$tipo" "$opcoes" \
+    >>"$PF_CASO/00_admin/log-de-acoes.log"
+fi
+UTIL
+
   instalar_utilitario pf-adquirir <<'UTIL'
 #!/usr/bin/env bash
 # pf-adquirir — aquisição forense com dc3dd: bloqueia, copia, calcula e confere o SHA-256
@@ -657,7 +867,165 @@ exit "$codigo"
 UTIL
 }
 
-# --- 7. Inventário --------------------------------------------------------------
+# --- 8. Integridade do sistema ----------------------------------------------------
+# Escreve uma seção do relatório com a saída (ou "nada encontrado").
+secao_relatorio() {
+  local titulo="$1" arquivo="$2"
+  {
+    printf '\n## %s\n\n' "$titulo"
+    if [[ -s "$arquivo" ]]; then
+      echo '```'; cat "$arquivo"; echo '```'
+    else
+      echo "Nada encontrado."
+    fi
+  } >>"$RELATORIO_INTEGRIDADE"
+}
+
+# Guia de leitura dos alertas: o que costuma aparecer numa estação Kali/Debian
+# recém-configurada e como confirmar. Os alertas NÃO são silenciados — numa
+# estação forense é melhor ver e justificar do que esconder.
+notas_falsos_positivos() {
+  cat <<'EOF'
+
+## Como ler os alertas — falsos positivos comuns no Kali/Debian
+
+Os itens abaixo aparecem com frequência numa estação recém-configurada e,
+em geral, não indicam comprometimento. Confirme antes de descartar.
+
+| Ferramenta | Alerta | Por que costuma ser normal | Como confirmar |
+|---|---|---|---|
+| rkhunter | `lwp-request` substituído por script | É um script Perl desde sempre (pacote libwww-perl) | `dpkg -S /usr/bin/lwp-request` e `dpkg --verify libwww-perl` |
+| rkhunter | Memória compartilhada grande (xfdesktop, thunar, Xorg…) | Área de trabalho usa memória compartilhada para imagens | Processo pertence ao seu usuário e ao ambiente gráfico |
+| rkhunter | Usuário/grupo `clamav` adicionado | Criado pela instalação do ClamAV neste setup | `dpkg -l clamav` |
+| rkhunter | `PermitRootLogin` não definido | Recomendação de configuração do SSH, não infecção | `systemctl is-active ssh` (no Kali vem desligado) |
+| rkhunter | `/dev/shm/sem.haveged_sem` | Semáforo do serviço de entropia `haveged` | `systemctl status haveged` |
+| rkhunter | `/etc/.java`, `/etc/.updated` | Preferências do Java; marcador de atualização do systemd | `cat /etc/.updated` mostra a data da última atualização |
+| chkrootkit | Arquivos ocultos com `[From Debian package: …]` | Arquivos legítimos de pacotes (`.gitkeep`, `.document`…) | Já conferidos pelo `dpkg --verify` acima |
+| chkrootkit | `PACKET SNIFFER(/usr/sbin/NetworkManager…)` | O NetworkManager abre socket de rede bruto para o DHCP | `ip link show` não deve mostrar `PROMISC` |
+| dpkg | Arquivos `*.original` ausentes em `/etc` | Backups criados e removidos pelos pacotes de personalização do Kali | `dpkg -S <arquivo>` |
+
+Atenção de verdade: arquivo de **programa** com hash diferente no `dpkg --verify`,
+`INFECTED` no chkrootkit, interface em modo `PROMISC` sem você ter ativado, ou
+alerta do rkhunter sobre rootkit conhecido.
+EOF
+}
+
+validar_integridade() {
+  etapa "Validando a integridade do sistema"
+  if (( ! VERIFICAR )); then info "Pulado (--sem-verificacao)"; return 0; fi
+  RELATORIO_INTEGRIDADE="$DIR_FORENSE/inventario/integridade-sistema-$CARIMBO.md"
+  if (( DRY_RUN )); then
+    executar dpkg --verify
+    executar rkhunter --propupd
+    executar rkhunter --check --skip-keypress --report-warnings-only
+    executar chkrootkit -q
+    info "[dry-run] geraria $RELATORIO_INTEGRIDADE"
+    return 0
+  fi
+
+  local tmp n_pacote n_conf n_ausentes n_rk n_chk n_chk_pac
+  tmp="$(mktemp -d)"
+
+  # 8.1 Arquivos de todos os pacotes instalados contra os hashes do dpkg.
+  #     Linha "??5?????? c /etc/x" = arquivo de configuração alterado (esperado após ajustes);
+  #     sem o "c" = binário/biblioteca diferente do que o pacote instalou (suspeito).
+  info "dpkg --verify: conferindo os arquivos de todos os pacotes (pode levar alguns minutos)..."
+  LC_ALL=C dpkg --verify >"$tmp/dpkg-todos" 2>&1 || true
+  #     "missing" = arquivo do pacote que não existe mais (comum em docs/manuais excluídos).
+  awk '/^dpkg:/ {next} $2 != "c" && $1 != "missing"' "$tmp/dpkg-todos" >"$tmp/dpkg-pacote"
+  awk '/^dpkg:/ {next} $2 == "c"' "$tmp/dpkg-todos" >"$tmp/dpkg-conf"
+  awk '/^dpkg:/ {next} $2 != "c" && $1 == "missing"' "$tmp/dpkg-todos" >"$tmp/dpkg-ausentes"
+  grep '^dpkg:' "$tmp/dpkg-todos" >"$tmp/dpkg-avisos" || true
+  n_pacote="$(grep -c . "$tmp/dpkg-pacote" || true)"
+  n_conf="$(grep -c . "$tmp/dpkg-conf" || true)"
+  n_ausentes="$(grep -c . "$tmp/dpkg-ausentes" || true)"
+  if (( n_pacote == 0 )); then
+    ok "dpkg: todos os arquivos de programas existentes conferem com os pacotes"
+  else
+    aviso "dpkg: $n_pacote arquivo(s) de programas com hash diferente do pacote original — veja o relatório"
+  fi
+  info "dpkg: $n_conf arquivo(s) de configuração alterados (normal após ajustes do sistema)"
+  if (( n_ausentes )); then info "dpkg: $n_ausentes arquivo(s) de pacotes ausentes (geralmente documentação removida)"; fi
+  RESUMO_INTEGRIDADE+=("dpkg --verify: $n_pacote arquivo(s) de programas alterados, $n_conf de configuração alterados, $n_ausentes ausentes")
+
+  # 8.2 rkhunter: com o sistema já conferido acima, registra a base de propriedades
+  #     dos arquivos (--propupd) e procura rootkits.
+  if command -v rkhunter >/dev/null; then
+    info "rkhunter: registrando a base dos arquivos do sistema e procurando rootkits..."
+    rkhunter --propupd --nocolors >>"$LOG" 2>&1 || true
+    rkhunter --check --skip-keypress --report-warnings-only --nocolors >"$tmp/rkhunter" 2>&1 || true
+    # Debian/Kali trazem WEB_CMD="/bin/false", que o rkhunter rejeita; corrige e repete.
+    if grep -q 'Invalid WEB_CMD' "$tmp/rkhunter" && grep -q '^WEB_CMD=' /etc/rkhunter.conf 2>/dev/null; then
+      cp -a /etc/rkhunter.conf "/etc/rkhunter.conf.pedro-forense-$CARIMBO.bak"
+      sed -i 's|^WEB_CMD=.*|WEB_CMD=""|' /etc/rkhunter.conf
+      info "rkhunter: WEB_CMD inválido corrigido em /etc/rkhunter.conf (backup criado)"
+      rkhunter --propupd --nocolors >>"$LOG" 2>&1 || true
+      rkhunter --check --skip-keypress --report-warnings-only --nocolors >"$tmp/rkhunter" 2>&1 || true
+    fi
+    n_rk="$(grep -c 'Warning:' "$tmp/rkhunter" || true)"
+    if (( n_rk == 0 )); then ok "rkhunter: nenhum alerta"; else aviso "rkhunter: $n_rk alerta(s) — revise no relatório (há falsos positivos comuns)"; fi
+    RESUMO_INTEGRIDADE+=("rkhunter: $n_rk alerta(s)")
+  else
+    aviso "rkhunter não instalado — verificação pulada"; : >"$tmp/rkhunter"
+    RESUMO_INTEGRIDADE+=("rkhunter: não executado")
+  fi
+
+  # 8.3 chkrootkit em modo silencioso: só imprime o que for suspeito.
+  if command -v chkrootkit >/dev/null; then
+    info "chkrootkit: procurando rootkits..."
+    chkrootkit -q >"$tmp/chkrootkit-bruto" 2>&1 || true
+    # Arquivos ocultos que o próprio chkrootkit identifica como de pacote Debian
+    # ("[From Debian package: x]") já foram conferidos pelo dpkg --verify: vão para
+    # uma seção informativa. O resto segue como item a revisar; um cabeçalho
+    # ("...found:") só aparece se houver item depois dele.
+    grep -F '[From Debian package' "$tmp/chkrootkit-bruto" >"$tmp/chkrootkit-pacotes" || true
+    awk '
+      /\[From Debian package/ {next}
+      /^[[:space:]]*$/         {next}
+      /:[[:space:]]*$/         {cab = $0; next}
+      { if (cab != "") { print cab; cab = "" }; print }
+    ' "$tmp/chkrootkit-bruto" >"$tmp/chkrootkit"
+    n_chk="$(grep -cv ':[[:space:]]*$' "$tmp/chkrootkit" || true)"
+    n_chk_pac="$(grep -c . "$tmp/chkrootkit-pacotes" || true)"
+    if (( n_chk == 0 )); then ok "chkrootkit: nada suspeito"; else aviso "chkrootkit: $n_chk item(ns) para revisar no relatório"; fi
+    if (( n_chk_pac )); then info "chkrootkit: $n_chk_pac arquivo(s) ocultos de pacotes Debian (informativo, já conferidos pelo dpkg)"; fi
+    RESUMO_INTEGRIDADE+=("chkrootkit: $n_chk item(ns) para revisar, $n_chk_pac arquivo(s) ocultos de pacotes (informativo)")
+  else
+    aviso "chkrootkit não instalado — verificação pulada"
+    : >"$tmp/chkrootkit"; : >"$tmp/chkrootkit-pacotes"
+    RESUMO_INTEGRIDADE+=("chkrootkit: não executado")
+  fi
+
+  {
+    echo "# Integridade do sistema — estação forense"
+    echo
+    echo "- Gerado em (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "- Host: $(hostname)"
+    echo "- Sistema: $DISTRO_NOME | kernel $(uname -r)"
+    echo "- Swap: ${RESUMO_SWAP:-não avaliado}"
+    echo
+    echo "## Resumo"
+    echo
+    printf -- '- %s\n' "${RESUMO_INTEGRIDADE[@]}"
+    echo
+    echo "Legenda do dpkg --verify: o \`5\` na 3ª posição indica hash MD5 diferente do pacote;"
+    echo "\`c\` marca arquivo de configuração; \`missing\`, arquivo do pacote que não existe mais."
+  } >"$RELATORIO_INTEGRIDADE"
+  secao_relatorio "dpkg --verify — arquivos de programas alterados (suspeitos)" "$tmp/dpkg-pacote"
+  secao_relatorio "dpkg --verify — arquivos de configuração alterados" "$tmp/dpkg-conf"
+  secao_relatorio "dpkg --verify — avisos do dpkg" "$tmp/dpkg-avisos"
+  secao_relatorio "dpkg --verify — arquivos de pacotes ausentes" "$tmp/dpkg-ausentes"
+  secao_relatorio "rkhunter — alertas" "$tmp/rkhunter"
+  secao_relatorio "chkrootkit — itens para revisar" "$tmp/chkrootkit"
+  secao_relatorio "chkrootkit — arquivos ocultos de pacotes Debian (informativo)" "$tmp/chkrootkit-pacotes"
+  notas_falsos_positivos >>"$RELATORIO_INTEGRIDADE"
+  rm -rf "$tmp"
+  chown "$USUARIO:$GRUPO_USUARIO" "$RELATORIO_INTEGRIDADE"
+  registrar "Relatório de integridade: $RELATORIO_INTEGRIDADE | SHA-256 $(sha256sum "$RELATORIO_INTEGRIDADE" | cut -d' ' -f1)"
+  ok "Relatório: $RELATORIO_INTEGRIDADE"
+}
+
+# --- 9. Inventário --------------------------------------------------------------
 versao_de() {
   local bin="$1" arg="$2" saida
   saida="$(timeout 10 "$bin" "$arg" 2>&1 </dev/null || true)"
@@ -695,6 +1063,10 @@ gerar_inventario() {
     echo "- Host: $(hostname)"
     echo "- Sistema: $DISTRO_NOME | kernel $(uname -r)"
     echo "- Script: pedro-setup-forense.sh v$VERSAO | SHA-256 $(sha256sum "$SCRIPT_PATH" | cut -d' ' -f1)"
+    echo "- Swap: ${RESUMO_SWAP:-não avaliado}"
+    if [[ -n "$RELATORIO_INTEGRIDADE" && -f "$RELATORIO_INTEGRIDADE" ]]; then
+      echo "- Integridade do sistema: \`${RELATORIO_INTEGRIDADE##*/}\` (SHA-256 $(sha256sum "$RELATORIO_INTEGRIDADE" | cut -d' ' -f1))"
+    fi
     echo
     echo "| Ferramenta | Versão | Pacote | Caminho | SHA-256 do binário |"
     echo "|---|---|---|---|---|"
@@ -731,6 +1103,10 @@ resumo() {
     ok "Pacotes instalados agora: ${#INSTALADOS[@]} | já presentes: ${#JA_PRESENTES[@]}"
   fi
   if (( ${#PY_OK[@]} )); then ok "Ferramentas Python: ${PY_OK[*]}"; fi
+  if [[ -n "$RESUMO_SWAP" ]]; then info "Swap: $RESUMO_SWAP"; fi
+  local linha
+  for linha in "${RESUMO_INTEGRIDADE[@]}"; do info "Integridade — $linha"; done
+  if [[ -n "$RELATORIO_INTEGRIDADE" && -f "$RELATORIO_INTEGRIDADE" ]]; then info "Relatório de integridade: $RELATORIO_INTEGRIDADE"; fi
   if (( ${#PULADOS[@]} )); then aviso "Indisponíveis nesta distro: ${PULADOS[*]}"; fi
   if (( ${#FALHAS[@]} )); then erro "Falharam: ${FALHAS[*]} (veja o log)"; fi
   info "Log: $LOG"
@@ -746,6 +1122,7 @@ ${NEG}Próximos passos${RST}
        pf-novo-caso CASO-001 "Pedro"
        export PF_CASO=~/forense/casos/CASO-001
        pf-nota "Início da análise"
+  4. Só agora conecte a evidência. Para montar: sudo -E pf-montar /dev/sdX1
 EOF
 }
 
@@ -759,8 +1136,10 @@ main() {
   preparar_repositorios
   instalar_pacotes
   instalar_python
+  desativar_swap
   configurar_protecoes
   instalar_utilitarios
+  validar_integridade
   gerar_inventario
   resumo
 }

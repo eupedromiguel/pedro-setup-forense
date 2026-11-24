@@ -1,6 +1,6 @@
 # Pedro Ataides - Setup Forense
 
-Script que transforma uma VM Linux recém-instalada em uma **estação de Forense Digital** pronta para laboratório: instala as ferramentas, protege as evidências contra alteração acidental, cria utilitários para conduzir um caso do início ao fim e gera um inventário auditável das ferramentas.
+Script que transforma uma VM Linux recém-instalada em uma **estação de Forense Digital** pronta para laboratório: instala as ferramentas, desativa o swap, protege as evidências contra alteração acidental (sem montagem automática e com montagem somente leitura), valida a integridade do sistema, cria utilitários para conduzir um caso do início ao fim e gera um inventário auditável das ferramentas.
 
 > Projeto de portfólio - laboratório de estudos em Segurança da Informação / DFIR.
 
@@ -22,11 +22,23 @@ Script que transforma uma VM Linux recém-instalada em uma **estação de Forens
 | 2. Repositórios | Habilita o `universe` no Ubuntu, se preciso, e atualiza os índices (espera o lock do apt, comum em VM recém-criada) |
 | 3. Ferramentas | Instala em lote; se falhar, tenta pacote a pacote para isolar o problema. Pacotes que não existem na distro são pulados e reportados |
 | 4. Python | Instala Volatility 3 e oletools via `pipx`, no usuário normal (não root) |
-| 5. Proteção | Desativa a montagem automática de mídias (regra udev + GNOME/XFCE) |
-| 6. Utilitários | Cria os comandos `pf-*` e a pasta `~/forense` |
-| 7. Inventário | Gera um `.md` com versão, pacote, caminho e SHA-256 de cada ferramenta |
+| 5. Swap | Desliga o swap (`swapoff -a`), comenta as linhas de swap do `/etc/fstab` (com backup) e mascara o `swap.target` do systemd, para que dados de evidência não sejam gravados no disco da estação |
+| 6. Proteção | Desativa a montagem automática (regra udev + GNOME/XFCE); coloca discos USB em **somente leitura no kernel** assim que são conectados (`blockdev --setro`); faz o udisks montar em `ro,nosuid,nodev,noexec` (ext3/ext4 com `noload`) |
+| 7. Utilitários | Cria os comandos `pf-*` e a pasta `~/forense` |
+| 8. Integridade | Confere todos os arquivos dos pacotes instalados (`dpkg --verify`), registra a base do `rkhunter` e procura rootkits (`rkhunter` e `chkrootkit`); gera um relatório `.md` |
+| 9. Inventário | Gera um `.md` com versão, pacote, caminho e SHA-256 de cada ferramenta |
 
 Tudo é registrado com horário UTC em `/var/log/pedro-setup-forense/`. Há modo `--dry-run` para ver o que seria feito sem alterar nada.
+
+> [!WARNING]
+> **Execute o script antes de conectar qualquer evidência à VM.**
+> As regras de proteção (sem montagem automática e USB em somente leitura) só valem
+> para mídias conectadas *depois* da instalação. Um disco que já estava conectado
+> (ou montado) não fica protegido.
+>
+> - No VirtualBox, só passe o dispositivo USB para a VM depois do setup.
+> - Se uma evidência já estava montada, desmonte-a e registre o ocorrido no log do caso (`pf-nota`).
+> - Antes de analisar, confirme o bloqueio de escrita: `sudo pf-bloquear /dev/sdX`.
 
 ## Ferramentas instaladas
 
@@ -52,6 +64,7 @@ Tudo é registrado com horário UTC em `/var/log/pedro-setup-forense/`. Há modo
 | `pf-nota "texto"` | Registra uma ação no log do caso, com horário UTC e usuário |
 | `pf-hash <arquivo...>` | Calcula MD5, SHA-1 e SHA-256 numa única leitura e registra em `hashes.tsv` |
 | `sudo pf-bloquear /dev/sdX` | Bloqueio de escrita por software (`blockdev --setro`) no disco e em todas as partições |
+| `sudo -E pf-montar <partição\|imagem.dd> [ponto]` | Bloqueia o disco e monta em **somente leitura** com `ro,noexec,nodev,nosuid` + sem replay de journal (`noload` no ext3/4, `norecovery` no XFS); imagens são abertas por loop somente leitura |
 | `sudo -E pf-adquirir <origem> [nome.dd]` | Aquisição com dc3dd: bloqueia, copia, calcula e **confere** o SHA-256 da imagem |
 
 Estrutura criada por `pf-novo-caso`:
@@ -84,6 +97,19 @@ sudo ./pedro-setup-forense.sh          # instalação completa
 sudo ./pedro-setup-forense.sh --sem-gui   # VM sem interface gráfica
 ```
 
+| Opção | Efeito |
+|---|---|
+| `-n`, `--dry-run` | Mostra o que seria feito, sem alterar nada |
+| `-g`, `--sem-gui` | Não instala ferramentas gráficas |
+| `-p`, `--sem-python` | Não instala Volatility 3 / oletools |
+| `-s`, `--manter-swap` | Não desativa o swap |
+| `-i`, `--sem-verificacao` | Não roda a validação de integridade (`dpkg --verify`, rkhunter, chkrootkit) |
+| `-y`, `--sim` | Não pede confirmação |
+
+Sem swap, a VM depende só da RAM: com menos de 4 GB, Autopsy e Volatility podem ser encerrados por falta de memória (o script avisa).
+
+O relatório de integridade fica em `~/forense/inventario/integridade-sistema-<data>.md`. Arquivos de configuração alterados e documentação ausente são normais; atenção aos **arquivos de programas com hash diferente** e aos alertas do rkhunter/chkrootkit. Esses dois têm falsos positivos conhecidos no Kali; o próprio relatório traz uma seção explicando os mais comuns e como confirmar cada um.
+
 Depois da instalação: reinicie, tire um snapshot `forense-baseline` e, durante as análises, deixe a rede da VM em **Não conectado** ou **Host-only**.
 
 ## Exemplo de fluxo (treino)
@@ -108,6 +134,9 @@ pf-adquirir pendrive-teste.img          # arquivo de treino: não precisa de sud
 pf-hash "$PF_CASO"/02_imagens/*.dd
 
 # 4. Análise
+# (opcional) navegar pela imagem montada em somente leitura
+# sudo -E pf-montar "$PF_CASO"/02_imagens/*.dd /mnt/evidencia/caso001
+
 fls -r "$PF_CASO"/02_imagens/*.dd
 #   r/r 4:    planilha.txt
 #   r/r * 5:  _egredo.txt    <- apagado (*); no FAT a 1ª letra do nome é sobrescrita
@@ -117,7 +146,9 @@ icat "$PF_CASO"/02_imagens/*.dd 5 > "$PF_CASO/03_exportados/segredo.txt"
 
 ## Boas práticas forenses aplicadas
 
-- **Preservação da evidência:** sem montagem automática; bloqueio de escrita antes da aquisição.
+- **Preservação da evidência:** sem montagem automática; USB em somente leitura no kernel ao ser conectado; montagens sempre `ro` e sem replay de journal; bloqueio de escrita antes da aquisição.
+- **Sem swap:** conteúdo de evidências e dumps de memória não vão parar no disco da estação.
+- **Estação confiável:** integridade dos pacotes conferida (`dpkg --verify`) e varredura de rootkits antes do uso.
 - **Integridade:** hash da origem calculado durante a cópia e conferido contra a imagem.
 - **Cadeia de custódia:** modelo baseado nos arts. 158-A a 158-F do CPP (Lei 13.964/2019) e na ABNT NBR ISO/IEC 27037.
 - **Rastreabilidade:** log de ações por caso, sempre em UTC.
@@ -127,11 +158,21 @@ icat "$PF_CASO"/02_imagens/*.dd 5 > "$PF_CASO/03_exportados/segredo.txt"
 ## Desfazer
 
 ```bash
-sudo rm /usr/local/bin/pf-{novo-caso,nota,hash,bloquear,adquirir}
-sudo rm /etc/udev/rules.d/99-pedro-forense-sem-automount.rules
+sudo rm /usr/local/bin/pf-{novo-caso,nota,hash,bloquear,montar,adquirir}
+sudo rm /etc/udev/rules.d/99-pedro-forense-{sem-automount,usb-somente-leitura}.rules
 sudo udevadm control --reload-rules
+sudo rm /etc/udisks2/mount_options.conf    # se havia um antes, restaure o .pedro-forense-*.bak
+
+# Reativar o swap
+sudo cp /etc/fstab.pedro-forense-<data>.bak /etc/fstab
+sudo systemctl unmask swap.target
+sudo swapon -a
 ```
 
 Ou simplesmente volte ao snapshot anterior da VM.
 
-**Aviso:** uso educacional, em ambiente de laboratório. 
+**Aviso:** uso educacional, em ambiente de laboratório.
+
+## Licença
+
+Distribuído sob a licença MIT — veja [LICENSE](LICENSE). Histórico de versões em [CHANGELOG.md](CHANGELOG.md). 
